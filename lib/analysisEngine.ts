@@ -14,18 +14,123 @@ import {
   Po3CycleInfo
 } from "./types";
 
-/* ---------------------------------------------
-   🔧 HELPER — Convert JS Date → New York Date
----------------------------------------------- */
-function toNY(date: Date): Date {
+// -------------------------------
+// 🔥 FIXED TIME + SESSION ENGINE
+// -------------------------------
+
+const NY_TZ = "America/New_York";
+
+/** Get *exact* New York Date() in local timezone */
+export function getNYDate(): Date {
+  const nowUtc = new Date();
   return new Date(
-    date.toLocaleString("en-US", { timeZone: "America/New_York" })
+    nowUtc.toLocaleString("en-US", {
+      timeZone: NY_TZ,
+    })
   );
 }
 
-function getNYMinutes(d: Date): number {
-  return d.getHours() * 60 + d.getMinutes();
+/** YYYY-MM-DD in NY time — SAFE */
+export function getNYDateString(date?: Date): string {
+  const d = date ? date : getNYDate();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
+
+/** NY local time as ISO string */
+export function getNYIso(): string {
+  return new Date(
+    new Date().toLocaleString("en-US", { timeZone: NY_TZ })
+  ).toISOString();
+}
+
+/** NY hour + minute from real NY-local Date */
+export function getNYHM() {
+  const d = getNYDate();
+  return {
+    hour: d.getHours(),
+    minute: d.getMinutes(),
+    minutesTotal: d.getHours() * 60 + d.getMinutes(),
+  };
+}
+
+/** Returns the correct “yesterday in NY” accounting for RTH close (16:00) */
+export function getYesterdayNY(): string {
+  const ny = getNYDate();
+  const h = ny.getHours();
+  const min = ny.getMinutes();
+
+  // If before 16:00 NY, previous session’s date = yesterday
+  if (h < 16 || (h === 16 && min < 1)) {
+    ny.setDate(ny.getDate() - 1);
+  }
+
+  return getNYDateString(ny);
+}
+
+/** Build fully accurate time context with sessions + killzones */
+export function buildTimeContext(): TimeContext {
+  const nowNY = getNYDate();
+  const iso = nowNY.toISOString();
+
+  const { hour, minutesTotal } = getNYHM();
+
+  // --- Sessions (NY time)
+  let session: MarketSession = "OFF_HOURS";
+
+  if (minutesTotal >= 0 && minutesTotal < 300) {
+    session = "ASIA";
+  } else if (minutesTotal >= 300 && minutesTotal < 480) {
+    session = "LONDON";
+  } else if (minutesTotal >= 540 && minutesTotal < 690) {
+    session = "NY_PREOPEN";
+  } else if (minutesTotal >= 570 && minutesTotal < 720) {
+    session = "NY_AM";
+  } else if (minutesTotal >= 720 && minutesTotal < 900) {
+    session = "NY_LUNCH";
+  } else if (minutesTotal >= 900 && minutesTotal < 960) {
+    session = "NY_PM";
+  } else if (minutesTotal >= 960 && minutesTotal < 1020) {
+    session = "CLOSE";
+  }
+
+  // --- Killzones (NY minutes)
+  const kz = [
+    { tag: "ASIA_OPEN", start: 20, end: 120 },
+    { tag: "LONDON_OPEN", start: 300, end: 360 },
+    { tag: "NY_AM", start: 540, end: 690 },
+    { tag: "NY_LUNCH", start: 720, end: 780 },
+    { tag: "POWER_HOUR", start: 900, end: 960 },
+  ];
+
+  const activeKZ =
+    kz.find((z) => minutesTotal >= z.start && minutesTotal <= z.end) || null;
+
+  // --- Time Score
+  let timeScore = 20;
+  if (activeKZ) timeScore += 30;
+  if (hour >= 9 && hour <= 12) timeScore += 25; // AM volatility
+  if (hour >= 14 && hour <= 16) timeScore += 20; // PM reversal risk
+  if (hour < 6) timeScore -= 10; // overnight chop
+
+  if (timeScore < 0) timeScore = 0;
+  if (timeScore > 100) timeScore = 100;
+
+  return {
+    nowEST: iso,
+    session,
+    inReversalWindow: !!activeKZ,
+    killzone: activeKZ?.tag ?? "NONE",
+    isRTH: minutesTotal >= 570 && minutesTotal <= 960,
+    goldbachBucket: "NONE",
+    nextKeyTimeISO: null,
+    timeScore,
+    notes: [`Session: ${session}`, activeKZ ? `Killzone: ${activeKZ.tag}` : "Outside killzones"],
+  };
+}
+
 
 /* ---------------------------------------------
    🔥 SESSION ENGINE (RTH, London, Asia, etc.)
